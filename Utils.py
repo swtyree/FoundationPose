@@ -103,21 +103,47 @@ set_logging_format()
 
 
 
+def _texture_rgb_from_material(material):
+  """RGB array (H,W,3) from OBJ/MTL SimpleMaterial or glTF PBRMaterial."""
+  if material is None:
+    return None
+  im = getattr(material, 'image', None)
+  if im is not None:
+    return np.array(im.convert('RGB'))[..., :3]
+  # glTF 2.0 / GLB: PBRMaterial uses baseColorTexture, not .image
+  im = getattr(material, 'baseColorTexture', None)
+  if im is not None:
+    return np.array(im.convert('RGB'))[..., :3]
+  return None
+
+
 def make_mesh_tensors(mesh, device='cuda', max_tex_size=None):
   mesh_tensors = {}
   if isinstance(mesh.visual, trimesh.visual.texture.TextureVisuals):
-    img = np.array(mesh.visual.material.image.convert('RGB'))
-    img = img[...,:3]
-    if max_tex_size is not None:
-      max_size = max(img.shape[0], img.shape[1])
-      if max_size>max_tex_size:
-        scale = 1/max_size * max_tex_size
-        img = cv2.resize(img, fx=scale, fy=scale, dsize=None)
-    mesh_tensors['tex'] = torch.as_tensor(img, device=device, dtype=torch.float)[None]/255.0
-    mesh_tensors['uv_idx']  = torch.as_tensor(mesh.faces, device=device, dtype=torch.int)
-    uv = torch.as_tensor(mesh.visual.uv, device=device, dtype=torch.float)
-    uv[:,1] = 1 - uv[:,1]
-    mesh_tensors['uv']  = uv
+    material = mesh.visual.material
+    img = _texture_rgb_from_material(material)
+    if img is not None:
+      if max_tex_size is not None:
+        max_size = max(img.shape[0], img.shape[1])
+        if max_size>max_tex_size:
+          scale = 1/max_size * max_tex_size
+          img = cv2.resize(img, fx=scale, fy=scale, dsize=None)
+      mesh_tensors['tex'] = torch.as_tensor(img, device=device, dtype=torch.float)[None]/255.0
+      mesh_tensors['uv_idx']  = torch.as_tensor(mesh.faces, device=device, dtype=torch.int)
+      uv = torch.as_tensor(mesh.visual.uv, device=device, dtype=torch.float)
+      uv[:,1] = 1 - uv[:,1]
+      mesh_tensors['uv']  = uv
+    else:
+      # Textured visuals but no SimpleMaterial.image / no baseColorTexture (e.g. factor-only PBR)
+      bc = getattr(material, 'baseColorFactor', None)
+      if bc is not None:
+        bc = np.asarray(bc, dtype=np.float64).reshape(-1)
+        rgb = (np.clip(bc[:3], 0.0, 1.0) * 255.0).astype(np.float32)
+      else:
+        logging.info('WARN: PBR mesh has no usable texture or baseColorFactor; using gray')
+        rgb = np.array([128.0, 128.0, 128.0], dtype=np.float32)
+      vc = np.tile(rgb.reshape(1, 3), (len(mesh.vertices), 1))
+      mesh_tensors['vertex_color'] = torch.as_tensor(vc, device=device, dtype=torch.float) / 255.0
   else:
     if mesh.visual.vertex_colors is None:
       logging.info(f"WARN: mesh doesn't have vertex_colors, assigning a pure color")
